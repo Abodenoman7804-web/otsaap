@@ -1,6 +1,7 @@
 import { mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import path from "node:path";
 import { randomBytes } from "node:crypto";
+import { getStore } from "@netlify/blobs";
 import { db } from "@/db";
 import { media } from "@/db/schema";
 import { eq } from "drizzle-orm";
@@ -32,6 +33,47 @@ const ALLOWED: Record<MediaKind, string[]> = {
   ],
 };
 
+const useBlobStore = process.env.MEDIA_STORAGE_PROVIDER !== "local" && Boolean(process.env.NETLIFY);
+const mediaStore = useBlobStore ? getStore({ name: "media" }) : null;
+
+async function writeMediaBlob(id: string, bytes: Uint8Array) {
+  if (mediaStore) {
+    await mediaStore.set(id, bytes);
+    return;
+  }
+
+  await mkdir(UPLOAD_DIR, { recursive: true });
+  await writeFile(path.join(UPLOAD_DIR, id), bytes);
+}
+
+async function readMediaBlob(id: string): Promise<Uint8Array | null> {
+  if (mediaStore) {
+    const value = await mediaStore.get(id, { type: "arrayBuffer" });
+    if (!value) return null;
+    return new Uint8Array(value);
+  }
+
+  try {
+    const buffer = await readFile(path.join(UPLOAD_DIR, id));
+    return new Uint8Array(buffer);
+  } catch {
+    return null;
+  }
+}
+
+async function deleteMediaBlob(id: string) {
+  if (mediaStore) {
+    await mediaStore.delete(id);
+    return;
+  }
+
+  try {
+    await unlink(path.join(UPLOAD_DIR, id));
+  } catch {
+    // file already gone
+  }
+}
+
 export function detectKind(mime: string): MediaKind | null {
   if (mime.startsWith("image/")) return "image";
   if (mime.startsWith("video/")) return "video";
@@ -49,6 +91,7 @@ export function validateUpload(kind: MediaKind, mime: string, size: number): str
 export function extensionFor(mime: string, fileName: string): string {
   const fromName = path.extname(fileName).replace(".", "").toLowerCase();
   if (fromName && fromName.length <= 5) return fromName;
+
   const map: Record<string, string> = {
     "image/jpeg": "jpg",
     "image/png": "png",
@@ -62,6 +105,7 @@ export function extensionFor(mime: string, fileName: string): string {
     "application/pdf": "pdf",
     "text/plain": "txt",
   };
+
   return map[mime] ?? "bin";
 }
 
@@ -74,10 +118,9 @@ export async function storeUpload(
 ) {
   const id = randomBytes(12).toString("hex");
   const safeName = `${id}.${extensionFor(mime, fileName)}`;
-  await mkdir(UPLOAD_DIR, { recursive: true });
-  // The stored filename is exactly the media id so downloads stay extension-less
-  // and unguessable; the original name is preserved in the database row.
-  await writeFile(path.join(UPLOAD_DIR, id), bytes);
+
+  await writeMediaBlob(id, bytes);
+
   const [row] = await db
     .insert(media)
     .values({
@@ -89,26 +132,19 @@ export async function storeUpload(
       sizeBytes: bytes.byteLength,
     })
     .returning();
+
   return row;
 }
 
 export async function readMediaFile(id: string) {
-  try {
-    const buffer = await readFile(path.join(UPLOAD_DIR, id));
-    return new Uint8Array(buffer);
-  } catch {
-    return null;
-  }
+  return readMediaBlob(id);
 }
 
 export async function deleteMediaRow(id: string) {
   const rows = await db.select().from(media).where(eq(media.id, id)).limit(1);
   const row = rows[0];
   if (!row) return;
+
   await db.delete(media).where(eq(media.id, id));
-  try {
-    await unlink(path.join(UPLOAD_DIR, id));
-  } catch {
-    // file already gone
-  }
+  await deleteMediaBlob(id);
 }
